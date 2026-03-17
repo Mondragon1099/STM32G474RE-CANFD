@@ -12,9 +12,13 @@
   *   - Rotary encoder : incremental angle (TIM3)
   *   - Potentiometer  : fan duty cycle   (ADC1, TIM6 ISR)
   *
-  * CAN FD TX frames:
+  * CAN FD TX frames (built and sent via can_frames.c):
   *   ID 0x000  — AS5600 steering angle (bytes 0-1, deg x10 as uint16)
   *   ID 0x001  — dummy frame (proof of concept, bytes 0-1 = 0xDE, 0xAD)
+  *
+  * Timing:
+  *   All frames currently send at 1000ms (HAL_GetTick based, non-blocking)
+  *   To change a rate later, just update its #define below
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -22,6 +26,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "string.h"
+#include "can_frames.h"   /* CAN FD frame functions */
 
 /* Private variables ---------------------------------------------------------*/
 COM_InitTypeDef BspCOMInit;
@@ -68,12 +73,19 @@ volatile uint8_t  new_rpm_ready   = 0;*/
 /*volatile float   rpm_buffer[AVG_SAMPLES] = {0};
 volatile uint8_t rpm_buffer_index        = 0;*/
 
-/* --- FDCAN TX --- */
-FDCAN_FilterTypeDef   sFilterConfig;
-FDCAN_TxHeaderTypeDef TxHeader_0x000;   /* AS5600 steering angle */
-FDCAN_TxHeaderTypeDef TxHeader_0x001;   /* dummy frame           */
-uint8_t TxData_0x000[64];
-uint8_t TxData_0x001[64];
+/* --- FDCAN filter config --- */
+FDCAN_FilterTypeDef sFilterConfig;
+
+/* --- Sensor update rate (ms) ---
+ * All sensors share the same rate for now.
+ * To set different rates later, add one #define per sensor
+ * and a matching last_tick variable below. */
+#define SENSOR_RATE_MS   1000U
+
+/* --- Tick timestamps — one per frame ---
+ * Initialised to 0, first update fires immediately on boot */
+static uint32_t last_tick_steering = 0;
+static uint32_t last_tick_dummy    = 0;
 
 /* USER CODE END PV */
 
@@ -216,28 +228,6 @@ int main(void)
             FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE) != HAL_OK)
         Error_Handler();
 
-    /* --- TX header for ID 0x000 (AS5600 steering angle) --- */
-    TxHeader_0x000.Identifier          = 0x000;
-    TxHeader_0x000.IdType              = FDCAN_STANDARD_ID;
-    TxHeader_0x000.TxFrameType         = FDCAN_DATA_FRAME;
-    TxHeader_0x000.DataLength          = FDCAN_DLC_BYTES_2;
-    TxHeader_0x000.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    TxHeader_0x000.BitRateSwitch       = FDCAN_BRS_OFF;
-    TxHeader_0x000.FDFormat            = FDCAN_FD_CAN;
-    TxHeader_0x000.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-    TxHeader_0x000.MessageMarker       = 0;
-
-    /* --- TX header for ID 0x001 (dummy) --- */
-    TxHeader_0x001.Identifier          = 0x001;
-    TxHeader_0x001.IdType              = FDCAN_STANDARD_ID;
-    TxHeader_0x001.TxFrameType         = FDCAN_DATA_FRAME;
-    TxHeader_0x001.DataLength          = FDCAN_DLC_BYTES_2;
-    TxHeader_0x001.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    TxHeader_0x001.BitRateSwitch       = FDCAN_BRS_OFF;
-    TxHeader_0x001.FDFormat            = FDCAN_FD_CAN;
-    TxHeader_0x001.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-    TxHeader_0x001.MessageMarker       = 0;
-
     /* --- Start FDCAN --- */
     if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
         Error_Handler();
@@ -254,106 +244,104 @@ int main(void)
     /* USER CODE END 2 */
 
     /* -----------------------------------------------------------------------
-     * Main loop
+     * Main loop — non-blocking, tick-based timing
+     *
+     * HAL_GetTick() returns milliseconds since boot.
+     * Each sensor block checks if enough time has passed since its
+     * last update using: now - last_tick >= SENSOR_RATE_MS
+     * The loop itself never blocks — no HAL_Delay() anywhere.
+     *
+     * To change a sensor to a different rate later:
+     *   1. Add a new #define e.g. #define STEERING_RATE_MS 100U
+     *   2. Replace SENSOR_RATE_MS in that block with the new define
      * --------------------------------------------------------------------- */
     while (1)
     {
-        printf("test\r\n");
-    	/*  --- RPM timeout check ---
-        current_time = __HAL_TIM_GET_COUNTER(&htim2);
-        uint32_t time_since_pulse;
-        if (current_time >= last_time)
-            time_since_pulse = current_time - last_time;
-        else
-            time_since_pulse = (0xFFFFFFFFU - last_time) + current_time;
-
-        if (time_since_pulse > RPM_TIMEOUT)
-        {
-            rpm     = 0.0f;
-            rpm_avg = 0.0f;
-        }
-        if (new_rpm_ready)
-        {
-            printf("RPM: %.1f\r\n", rpm_avg);
-            new_rpm_ready = 0;
-        }*/
-
-        /* --- AS5600 steering angle --- */
-        if (HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0E,
-                I2C_MEMADD_SIZE_8BIT, &as5600_data[0], 1, HAL_MAX_DELAY) == HAL_OK
-         && HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0F,
-                I2C_MEMADD_SIZE_8BIT, &as5600_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
-        {
-            as5600_raw = ((uint16_t)as5600_data[0] << 8) | as5600_data[1];
-            as5600_deg = (as5600_raw * 360.0f) / 4096.0f;
-        }
-
-       /*  --- ADXL345 #1 ---
-        HAL_I2C_Mem_Read(&hi2c3, 0xA6, 0x32, 1, adxl1_data, 6, HAL_MAX_DELAY);
-        ax1 = (int16_t)((adxl1_data[1] << 8) | adxl1_data[0]);
-        ay1 = (int16_t)((adxl1_data[3] << 8) | adxl1_data[2]);
-        az1 = (int16_t)((adxl1_data[5] << 8) | adxl1_data[4]);
-        float accel_x1 = ax1 * adxl_cal_val;
-        float accel_y1 = ay1 * adxl_cal_val;
-        float accel_z1 = az1 * adxl_cal_val;
-
-         --- ADXL345 #2 ---
-        HAL_I2C_Mem_Read(&hi2c3, 0x3A, 0x32, 1, adxl2_data, 6, HAL_MAX_DELAY);
-        ax2 = (int16_t)((adxl2_data[1] << 8) | adxl2_data[0]);
-        ay2 = (int16_t)((adxl2_data[3] << 8) | adxl2_data[2]);
-        az2 = (int16_t)((adxl2_data[5] << 8) | adxl2_data[4]);
-        float accel_x2 = ax2 * adxl_cal_val;
-        float accel_y2 = ay2 * adxl_cal_val;
-        float accel_z2 = az2 * adxl_cal_val;
-
-         --- Quadrature encoder ---
-        int16_t counts    = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
-        float   angle_deg = ((float)counts * 360.0f) / 16384.0f;*/
-
-        /* --- Debug UART --- */
-        uint32_t A = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6);
-        uint32_t B = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4);
-        printf("A=%lu B=%lu\r\n", A, B);
-/*        printf("counts: %d  encoder angle: %.2f deg\r\n", counts, angle_deg);*/
-        printf("AS5600 angle: %.2f deg\r\n", as5600_deg);
-/*        printf("Pulses: %lu  RPM: %.1f\r\n", pulse_count, rpm_avg);*/
-/*        printf("ADXL1  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x1, accel_y1, accel_z1);*/
-/*        printf("ADXL2  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x2, accel_y2, accel_z2);*/
+        /* Get current time in milliseconds */
+        uint32_t now = HAL_GetTick();
 
         /* -----------------------------------------------------------------
-         * CAN FD payload layout
-         *
          * ID 0x000 — AS5600 steering angle
-         * [0-1]  as5600_deg x10  uint16  e.g. 2700 = 270.0 deg
-         *
-         * ID 0x001 — dummy frame (proof of concept)
-         * [0-1]  0xDE 0xAD
          * ----------------------------------------------------------------- */
-
-        /* --- Build frame 0x000 — AS5600 steering angle --- */
-        memset(TxData_0x000, 0, sizeof(TxData_0x000));
-        uint16_t as5600_deg_int = (uint16_t)(as5600_deg * 10.0f);
-        TxData_0x000[0] = (as5600_deg_int >> 8) & 0xFF;
-        TxData_0x000[1] =  as5600_deg_int        & 0xFF;
-
-        /* --- Build frame 0x001 — dummy --- */
-        memset(TxData_0x001, 0, sizeof(TxData_0x001));
-        TxData_0x001[0] = 0xDE;
-        TxData_0x001[1] = 0xAD;
-
-        /* --- Transmit 0x000 --- */
-        if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader_0x000, TxData_0x000) != HAL_OK)
+        if (now - last_tick_steering >= SENSOR_RATE_MS)
         {
-            printf("TX 0x000 failed\r\n");
+            /* Read AS5600 */
+            if (HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0E,
+                    I2C_MEMADD_SIZE_8BIT, &as5600_data[0], 1, HAL_MAX_DELAY) == HAL_OK
+             && HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0F,
+                    I2C_MEMADD_SIZE_8BIT, &as5600_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
+            {
+                as5600_raw = ((uint16_t)as5600_data[0] << 8) | as5600_data[1];
+                as5600_deg = (as5600_raw * 360.0f) / 4096.0f;
+            }
+
+            /* Debug UART — before CAN TX so it always prints */
+            printf("AS5600 angle: %.2f deg\r\n", as5600_deg);
+
+            /* Transmit */
+            can_tx_steering(as5600_deg);
+
+            last_tick_steering = now;
         }
 
-        /* --- Transmit 0x001 --- */
-        if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader_0x001, TxData_0x001) != HAL_OK)
+        /* -----------------------------------------------------------------
+         * ID 0x001 — dummy frame
+         * ----------------------------------------------------------------- */
+        if (now - last_tick_dummy >= SENSOR_RATE_MS)
         {
-            printf("TX 0x001 failed\r\n");
+            can_tx_dummy();
+            last_tick_dummy = now;
         }
 
-        HAL_Delay(1000);
+        /*  --- ADXL345 #1 ---
+        if (now - last_tick_adxl1 >= SENSOR_RATE_MS)
+        {
+            HAL_I2C_Mem_Read(&hi2c3, 0xA6, 0x32, 1, adxl1_data, 6, HAL_MAX_DELAY);
+            ax1 = (int16_t)((adxl1_data[1] << 8) | adxl1_data[0]);
+            ay1 = (int16_t)((adxl1_data[3] << 8) | adxl1_data[2]);
+            az1 = (int16_t)((adxl1_data[5] << 8) | adxl1_data[4]);
+            float accel_x1 = ax1 * adxl_cal_val;
+            float accel_y1 = ay1 * adxl_cal_val;
+            float accel_z1 = az1 * adxl_cal_val;
+            printf("ADXL1  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x1, accel_y1, accel_z1);
+            can_tx_adxl1(accel_x1, accel_y1, accel_z1);
+            last_tick_adxl1 = now;
+        }*/
+
+        /*  --- ADXL345 #2 ---
+        if (now - last_tick_adxl2 >= SENSOR_RATE_MS)
+        {
+            HAL_I2C_Mem_Read(&hi2c3, 0x3A, 0x32, 1, adxl2_data, 6, HAL_MAX_DELAY);
+            ax2 = (int16_t)((adxl2_data[1] << 8) | adxl2_data[0]);
+            ay2 = (int16_t)((adxl2_data[3] << 8) | adxl2_data[2]);
+            az2 = (int16_t)((adxl2_data[5] << 8) | adxl2_data[4]);
+            float accel_x2 = ax2 * adxl_cal_val;
+            float accel_y2 = ay2 * adxl_cal_val;
+            float accel_z2 = az2 * adxl_cal_val;
+            printf("ADXL2  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x2, accel_y2, accel_z2);
+            can_tx_adxl2(accel_x2, accel_y2, accel_z2);
+            last_tick_adxl2 = now;
+        }*/
+
+        /*  --- Quadrature encoder ---
+        if (now - last_tick_encoder >= SENSOR_RATE_MS)
+        {
+            int16_t counts    = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+            float   angle_deg = ((float)counts * 360.0f) / 16384.0f;
+            printf("counts: %d  encoder angle: %.2f deg\r\n", counts, angle_deg);
+            can_tx_encoder(counts, angle_deg);
+            last_tick_encoder = now;
+        }*/
+
+        /*  --- RPM ---
+        if (now - last_tick_rpm >= SENSOR_RATE_MS)
+        {
+            if (time_since_pulse > RPM_TIMEOUT) { rpm = 0.0f; rpm_avg = 0.0f; }
+            printf("RPM: %.1f\r\n", rpm_avg);
+            can_tx_rpm(rpm_avg);
+            last_tick_rpm = now;
+        }*/
+
     }
 }
 
