@@ -5,73 +5,125 @@
   * @brief          : Sensor Hub + FDCAN Transmit — STM32G474RE
   *
   * Sensors:
-  *   - AS5600  : magnetic steering angle (I2C3, addr 0x36)
-  *   - ADXL345 #1 : motor 1 vibration   (I2C3, addr 0x53 / 0xA6)
-  *   - ADXL345 #2 : motor 2 vibration   (I2C3, addr 0x1D / 0x3A)
-  *   - Hall sensor : motor RPM           (PA0, EXTI0)
-  *   - Rotary encoder : incremental angle (TIM3)
-  *   - Potentiometer  : fan duty cycle   (ADC1, TIM6 ISR)
+  *   - AS5600 #1 : magnetic steering angle (I2C3, addr 0x36)
+  *   - AS5600 #2 : magnetic steering angle (I2C4, addr 0x36)
+  *   - AS5600 #3 : magnetic steering angle (I2C2, addr 0x36)
+  *   - ADXL345 #1 : motor 1 vibration      (I2C3, addr 0x53 / 0xA6)
+  *   - ADXL345 #2 : motor 2 vibration      (I2C3, addr 0x1D / 0x3A)
+  *   - Hall sensor #1 : motor RPM          (PA0, EXTI0)
+  *   - Hall sensor #2 : motor RPM          (PA1, EXTI1)
+  *   - Throttle : 0-5V mapping             (PC0, ADC1)
   *
   * CAN FD TX frames (built and sent via can_frames.c):
-  *   ID 0x000  — AS5600 steering angle (bytes 0-1, deg x10 as uint16)
-  *   ID 0x001  — dummy frame (proof of concept, bytes 0-1 = 0xDE, 0xAD)
+  *   ID 0x000  — AS5600 #1 steering angle     2 bytes
+  *   ID 0x001  — dummy frame                  2 bytes
+  *   ID 0x002  — ADXL345 #1 (motor 1)         8 bytes (6 data + 2 pad)
+  *   ID 0x003  — ADXL345 #2 (motor 2)         8 bytes (6 data + 2 pad)
+  *   ID 0x004  — Hall sensor #1 RPM           2 bytes
+  *   ID 0x006  — AS5600 #2 steering angle     2 bytes
+  *   ID 0x007  — AS5600 #3 steering angle     2 bytes
+  *   ID 0x008  — Hall sensor #2 RPM           2 bytes
+  *   ID 0x009  — Throttle                     2 bytes
   *
   * Timing:
   *   All frames currently send at 1000ms (HAL_GetTick based, non-blocking)
-  *   To change a rate later, just update its #define below
+  *   To change a rate later, add a new #define and swap SENSOR_RATE_MS
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
 #include "string.h"
-#include "can_frames.h"   /* CAN FD frame functions */
+#include "can_frames.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+
 COM_InitTypeDef BspCOMInit;
 ADC_HandleTypeDef hadc1;
+
 FDCAN_HandleTypeDef hfdcan1;
+
+I2C_HandleTypeDef hi2c2;
 I2C_HandleTypeDef hi2c3;
-TIM_HandleTypeDef htim1;
+I2C_HandleTypeDef hi2c4;
+
 TIM_HandleTypeDef htim2;
-TIM_HandleTypeDef htim3;
-TIM_HandleTypeDef htim6;
 
 /* USER CODE BEGIN PV */
 
-/* --- AS5600 steering angle --- */
-uint8_t  as5600_data[2];
-uint16_t as5600_raw = 0;
-float    as5600_deg = 0.0f;
+/* --- AS5600 #1 steering angle (I2C3) --- */
+uint8_t  as56001_data[2];
+uint16_t as56001_raw = 0;
+float    as56001_deg = 0.0f;
+
+/* --- AS5600 #2 steering angle (I2C4) --- */
+uint8_t  as56002_data[2];
+uint16_t as56002_raw = 0;
+float    as56002_deg = 0.0f;
+
+/* --- AS5600 #3 steering angle (I2C2) --- */
+uint8_t  as56003_data[2];
+uint16_t as56003_raw = 0;
+float    as56003_deg = 0.0f;
+
+/* --- Throttle 0-5V (ADC1) --- */
+uint16_t throttle_raw = 0;
+float    throttle_out = 0.0f;
 
 /* --- ADXL345 #1 (motor 1) --- */
-/*uint8_t  adxl1_id;
+uint8_t  adxl1_id;
 uint8_t  adxl1_data[6];
 int16_t  ax1, ay1, az1;
 uint8_t  adxl_power_ctl = 0x08;
-float    adxl_cal_val   = 0.0039f;*/
+float    adxl_cal_val   = 0.0039f;
 
 /* --- ADXL345 #2 (motor 2) --- */
-/*uint8_t  adxl2_id;
+uint8_t  adxl2_id;
 uint8_t  adxl2_data[6];
-int16_t  ax2, ay2, az2;*/
+int16_t  ax2, ay2, az2;
 
-/* --- Hall-effect RPM --- */
-/*volatile uint32_t pulse_count     = 0;
-volatile uint32_t last_time       = 0;
-volatile uint32_t current_time    = 0;
-volatile float    rpm             = 0.0f;
-volatile float    rpm_avg         = 0.0f;
-volatile uint8_t  new_rpm_ready   = 0;*/
-
-/*#define AVG_SAMPLES           5
+/* --- Hall-effect #1 RPM --- */
+#define AVG_SAMPLES           5
 #define PULSES_PER_REVOLUTION 4
-#define RPM_TIMEOUT           3000000U    3 s in microseconds
-#define TICKS_PER_SECOND      1000714.0f  calibrated */
+#define RPM_TIMEOUT           3000000U    // 3 s in microseconds
+#define TICKS_PER_SECOND      1000714.0f  // calibrated
+volatile uint32_t current_time    = 0;
 
-/*volatile float   rpm_buffer[AVG_SAMPLES] = {0};
-volatile uint8_t rpm_buffer_index        = 0;*/
+volatile uint32_t pulse_1_count     = 0;
+volatile uint32_t last_time_1       = 0;
+volatile float    rpm_1             = 0.0f;
+volatile float    rpm_1_avg         = 0.0f;
+volatile uint8_t  new_rpm_1_ready   = 0;
+volatile float   rpm_1_buffer[AVG_SAMPLES] = {0};
+volatile uint8_t rpm_1_buffer_index        = 0;
+
+/* --- Hall-effect #2 RPM --- */
+volatile uint32_t pulse_2_count     = 0;
+volatile uint32_t last_time_2       = 0;
+volatile float    rpm_2             = 0.0f;
+volatile float    rpm_2_avg         = 0.0f;
+volatile uint8_t  new_rpm_2_ready   = 0;
+volatile float   rpm_2_buffer[AVG_SAMPLES] = {0};
+volatile uint8_t rpm_2_buffer_index        = 0;
 
 /* --- FDCAN filter config --- */
 FDCAN_FilterTypeDef sFilterConfig;
@@ -79,13 +131,20 @@ FDCAN_FilterTypeDef sFilterConfig;
 /* --- Sensor update rate (ms) ---
  * All sensors share the same rate for now.
  * To set different rates later, add one #define per sensor
- * and a matching last_tick variable below. */
+ * and swap SENSOR_RATE_MS in that block. */
 #define SENSOR_RATE_MS   1000U
 
 /* --- Tick timestamps — one per frame ---
  * Initialised to 0, first update fires immediately on boot */
-static uint32_t last_tick_steering = 0;
-static uint32_t last_tick_dummy    = 0;
+static uint32_t last_tick_steering1 = 0;
+static uint32_t last_tick_steering2 = 0;
+static uint32_t last_tick_steering3 = 0;
+static uint32_t last_tick_throttle  = 0;
+static uint32_t last_tick_dummy     = 0;
+static uint32_t last_tick_adxl1     = 0;
+static uint32_t last_tick_adxl2     = 0;
+static uint32_t last_tick_rpm_1     = 0;
+static uint32_t last_tick_rpm_2     = 0;
 
 /* USER CODE END PV */
 
@@ -94,124 +153,136 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C3_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_TIM6_Init(void);
 static void MX_FDCAN1_Init(void);
+static void MX_I2C4_Init(void);
+static void MX_I2C2_Init(void);
+/* USER CODE BEGIN PFP */
 
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Read ADC once (blocking) */
-/*static uint16_t read_adc_once(void)
+/* Read ADC */
+static uint16_t read_adc(void)
 {
     HAL_ADC_Start(&hadc1);
     HAL_ADC_PollForConversion(&hadc1, 10);
     uint16_t v = (uint16_t)HAL_ADC_GetValue(&hadc1);
     HAL_ADC_Stop(&hadc1);
     return v;
-}*/
+}
 
-/* Set fan PWM duty 0.0 – 1.0 */
-/*static void fan_set_duty(float u)
+/* PA0/PA1 EXTI ISR — Hall sensor rising/falling edge for RPM */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (u < 0.0f) u = 0.0f;
-    if (u > 1.0f) u = 1.0f;
-    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)(u * (float)arr));
-}*/
+    uint32_t time_diff_1;
+    uint32_t time_diff_2;
+    current_time = __HAL_TIM_GET_COUNTER(&htim2);
 
-/* TIM6 overflow ISR — update fan duty from pot */
-/*void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM6)
-    {
-        uint16_t adc  = read_adc_once();
-        float    duty = (float)adc / 4095.0f;
-        fan_set_duty(duty);
-    }
-}*/
-
-/* PA0 EXTI ISR — Hall sensor rising/falling edge for RPM */
-/*void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
     if (GPIO_Pin == GPIO_PIN_0)
     {
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-
-        current_time = __HAL_TIM_GET_COUNTER(&htim2);
-
-        uint32_t time_diff;
-        if (current_time >= last_time)
-            time_diff = current_time - last_time;
+        if (current_time >= last_time_1)
+            time_diff_1 = current_time - last_time_1;
         else
-            time_diff = (0xFFFFFFFFU - last_time) + current_time;
+            time_diff_1 = (0xFFFFFFFFU - last_time_1) + current_time;
 
-        if (time_diff > 5000U)  debounce: >5 ms
+        if (time_diff_1 > 5000U) // >5 ms debounce
         {
-            rpm = (60.0f * TICKS_PER_SECOND) /
-                  ((float)time_diff * (float)PULSES_PER_REVOLUTION);
+            rpm_1 = (60.0f * TICKS_PER_SECOND) /
+                  ((float)time_diff_1 * (float)PULSES_PER_REVOLUTION);
 
-            rpm_buffer[rpm_buffer_index] = rpm;
-            rpm_buffer_index = (rpm_buffer_index + 1) % AVG_SAMPLES;
+            rpm_1_buffer[rpm_1_buffer_index] = rpm_1;
+            rpm_1_buffer_index = (rpm_1_buffer_index + 1) % AVG_SAMPLES;
 
-            float sum = 0.0f;
+            float sum_1 = 0.0f;
             for (int i = 0; i < AVG_SAMPLES; i++)
-                sum += rpm_buffer[i];
-            rpm_avg = sum / (float)AVG_SAMPLES;
+                sum_1 += rpm_1_buffer[i];
+            rpm_1_avg = sum_1 / (float)AVG_SAMPLES;
 
-            last_time     = current_time;
-            pulse_count++;
-            new_rpm_ready = 1;
+            last_time_1     = current_time;
+            pulse_1_count++;
+            new_rpm_1_ready = 1;
         }
     }
-}*/
+    else if (GPIO_Pin == GPIO_PIN_1)
+    {
+        if (current_time >= last_time_2)
+            time_diff_2 = current_time - last_time_2;
+        else
+            time_diff_2 = (0xFFFFFFFFU - last_time_2) + current_time;
+
+        if (time_diff_2 > 5000U) // >5 ms debounce
+        {
+            rpm_2 = (60.0f * TICKS_PER_SECOND) /
+                  ((float)time_diff_2 * (float)PULSES_PER_REVOLUTION);
+
+            rpm_2_buffer[rpm_2_buffer_index] = rpm_2;
+            rpm_2_buffer_index = (rpm_2_buffer_index + 1) % AVG_SAMPLES;
+
+            float sum_2 = 0.0f;
+            for (int i = 0; i < AVG_SAMPLES; i++)
+                sum_2 += rpm_2_buffer[i];
+            rpm_2_avg = sum_2 / (float)AVG_SAMPLES;
+
+            last_time_2     = current_time;
+            pulse_2_count++;
+            new_rpm_2_ready = 1;
+        }
+    }
+}
 
 /* USER CODE END 0 */
 
-/* =========================================================================
- * main
- * ========================================================================= */
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
-    /* USER CODE BEGIN 1 */
-    /* USER CODE END 1 */
 
-    HAL_Init();
-    SystemClock_Config();
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
 
-    MX_GPIO_Init();
-    MX_I2C3_Init();
-    MX_ADC1_Init();
-    MX_TIM1_Init();
-    MX_TIM2_Init();
-    MX_TIM3_Init();
-    MX_TIM6_Init();
-    MX_FDCAN1_Init();
+  /* MCU Configuration--------------------------------------------------------*/
 
-    /* USER CODE BEGIN 2 */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C3_Init();
+  MX_ADC1_Init();
+  MX_TIM2_Init();
+  MX_FDCAN1_Init();
+  MX_I2C4_Init();
+  MX_I2C2_Init();
+  /* USER CODE BEGIN 2 */
 
     /* --- Free-running microsecond timer --- */
     HAL_TIM_Base_Start(&htim2);
 
     /* --- ADXL345 #1 (addr 0xA6) --- */
-   /* HAL_I2C_Mem_Read (&hi2c3, 0xA6, 0x00, 1, &adxl1_id,    1, HAL_MAX_DELAY);
+    HAL_I2C_Mem_Read (&hi2c3, 0xA6, 0x00, 1, &adxl1_id,       1, HAL_MAX_DELAY);
     HAL_I2C_Mem_Write(&hi2c3, 0xA6, 0x2D, 1, &adxl_power_ctl, I2C_MEMADD_SIZE_8BIT, HAL_MAX_DELAY);
-    HAL_I2C_Mem_Write(&hi2c3, 0xA6, 0x31, 1, &adxl_power_ctl, I2C_MEMADD_SIZE_8BIT, HAL_MAX_DELAY);*/
+    HAL_I2C_Mem_Write(&hi2c3, 0xA6, 0x31, 1, &adxl_power_ctl, I2C_MEMADD_SIZE_8BIT, HAL_MAX_DELAY);
 
     /* --- ADXL345 #2 (addr 0x3A) --- */
-    /*HAL_I2C_Mem_Read (&hi2c3, 0x3A, 0x00, 1, &adxl2_id,    1, HAL_MAX_DELAY);
+    HAL_I2C_Mem_Read (&hi2c3, 0x3A, 0x00, 1, &adxl2_id,       1, HAL_MAX_DELAY);
     HAL_I2C_Mem_Write(&hi2c3, 0x3A, 0x2D, 1, &adxl_power_ctl, I2C_MEMADD_SIZE_8BIT, HAL_MAX_DELAY);
-    HAL_I2C_Mem_Write(&hi2c3, 0x3A, 0x31, 1, &adxl_power_ctl, I2C_MEMADD_SIZE_8BIT, HAL_MAX_DELAY);*/
-
-    /* --- Fan PWM --- */
-    /*HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-    fan_set_duty(0.0f);
-    HAL_TIM_Base_Start_IT(&htim6);*/
-
-    /* --- Quadrature encoder --- */
-   /* __HAL_TIM_SET_COUNTER(&htim3, 0);
-    HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);*/
+    HAL_I2C_Mem_Write(&hi2c3, 0x3A, 0x31, 1, &adxl_power_ctl, I2C_MEMADD_SIZE_8BIT, HAL_MAX_DELAY);
 
     /* --- FDCAN filter (required even for TX-only) --- */
     sFilterConfig.IdType       = FDCAN_STANDARD_ID;
@@ -241,371 +312,409 @@ int main(void)
     if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
         Error_Handler();
 
-    /* USER CODE END 2 */
+  /* USER CODE END 2 */
 
-    /* -----------------------------------------------------------------------
-     * Main loop — non-blocking, tick-based timing
-     *
-     * HAL_GetTick() returns milliseconds since boot.
-     * Each sensor block checks if enough time has passed since its
-     * last update using: now - last_tick >= SENSOR_RATE_MS
-     * The loop itself never blocks — no HAL_Delay() anywhere.
-     *
-     * To change a sensor to a different rate later:
-     *   1. Add a new #define e.g. #define STEERING_RATE_MS 100U
-     *   2. Replace SENSOR_RATE_MS in that block with the new define
-     * --------------------------------------------------------------------- */
-    while (1)
-    {
-        /* Get current time in milliseconds */
-        uint32_t now = HAL_GetTick();
+  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
+  BspCOMInit.BaudRate   = 115200;
+  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
+  BspCOMInit.StopBits   = COM_STOPBITS_1;
+  BspCOMInit.Parity     = COM_PARITY_NONE;
+  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
+  {
+    Error_Handler();
+  }
 
-        /* -----------------------------------------------------------------
-         * ID 0x000 — AS5600 steering angle
-         * ----------------------------------------------------------------- */
-        if (now - last_tick_steering >= SENSOR_RATE_MS)
-        {
-            /* Read AS5600 */
-            if (HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0E,
-                    I2C_MEMADD_SIZE_8BIT, &as5600_data[0], 1, HAL_MAX_DELAY) == HAL_OK
-             && HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0F,
-                    I2C_MEMADD_SIZE_8BIT, &as5600_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
-            {
-                as5600_raw = ((uint16_t)as5600_data[0] << 8) | as5600_data[1];
-                as5600_deg = (as5600_raw * 360.0f) / 4096.0f;
-            }
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+      uint32_t now = HAL_GetTick();
 
-            /* Debug UART — before CAN TX so it always prints */
-            printf("AS5600 angle: %.2f deg\r\n", as5600_deg);
+      /* -----------------------------------------------------------------
+       * ID 0x000 — AS5600 #1 steering angle (I2C3)
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_steering1 >= SENSOR_RATE_MS)
+      {
+          if (HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0E,
+                  I2C_MEMADD_SIZE_8BIT, &as56001_data[0], 1, HAL_MAX_DELAY) == HAL_OK
+           && HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0F,
+                  I2C_MEMADD_SIZE_8BIT, &as56001_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
+          {
+              as56001_raw = ((uint16_t)as56001_data[0] << 8) | as56001_data[1];
+              as56001_deg = (as56001_raw * 360.0f) / 4096.0f;
+          }
+          printf("AS5600 #1 angle: %.2f deg\r\n", as56001_deg);
+          can_tx_steering1(as56001_deg);
+          last_tick_steering1 = now;
+      }
 
-            /* Transmit */
-            can_tx_steering(as5600_deg);
+      /* -----------------------------------------------------------------
+       * ID 0x006 — AS5600 #2 steering angle (I2C4)
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_steering2 >= SENSOR_RATE_MS)
+      {
+          if (HAL_I2C_Mem_Read(&hi2c4, 0x36 << 1, 0x0E,
+                  I2C_MEMADD_SIZE_8BIT, &as56002_data[0], 1, HAL_MAX_DELAY) == HAL_OK
+           && HAL_I2C_Mem_Read(&hi2c4, 0x36 << 1, 0x0F,
+                  I2C_MEMADD_SIZE_8BIT, &as56002_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
+          {
+              as56002_raw = ((uint16_t)as56002_data[0] << 8) | as56002_data[1];
+              as56002_deg = (as56002_raw * 360.0f) / 4096.0f;
+          }
+          printf("AS5600 #2 angle: %.2f deg\r\n", as56002_deg);
+          can_tx_steering2(as56002_deg);
+          last_tick_steering2 = now;
+      }
 
-            last_tick_steering = now;
-        }
+      /* -----------------------------------------------------------------
+       * ID 0x007 — AS5600 #3 steering angle (I2C2)
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_steering3 >= SENSOR_RATE_MS)
+      {
+          if (HAL_I2C_Mem_Read(&hi2c2, 0x36 << 1, 0x0E,
+                  I2C_MEMADD_SIZE_8BIT, &as56003_data[0], 1, HAL_MAX_DELAY) == HAL_OK
+           && HAL_I2C_Mem_Read(&hi2c2, 0x36 << 1, 0x0F,
+                  I2C_MEMADD_SIZE_8BIT, &as56003_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
+          {
+              as56003_raw = ((uint16_t)as56003_data[0] << 8) | as56003_data[1];
+              as56003_deg = (as56003_raw * 360.0f) / 4096.0f;
+          }
+          printf("AS5600 #3 angle: %.2f deg\r\n", as56003_deg);
+          can_tx_steering3(as56003_deg);
+          last_tick_steering3 = now;
+      }
 
-        /* -----------------------------------------------------------------
-         * ID 0x001 — dummy frame
-         * ----------------------------------------------------------------- */
-        if (now - last_tick_dummy >= SENSOR_RATE_MS)
-        {
-            can_tx_dummy();
-            last_tick_dummy = now;
-        }
+      /* -----------------------------------------------------------------
+       * ID 0x009 — Throttle 0-5V (ADC)
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_throttle >= SENSOR_RATE_MS)
+      {
+          throttle_raw = read_adc();
+          throttle_out = (throttle_raw * 5.0f) / 4096.0f;
+          printf("Throttle: %.2f V\r\n", throttle_out);
+          can_tx_throttle(throttle_out);
+          last_tick_throttle = now;
+      }
 
-        /*  --- ADXL345 #1 ---
-        if (now - last_tick_adxl1 >= SENSOR_RATE_MS)
-        {
-            HAL_I2C_Mem_Read(&hi2c3, 0xA6, 0x32, 1, adxl1_data, 6, HAL_MAX_DELAY);
-            ax1 = (int16_t)((adxl1_data[1] << 8) | adxl1_data[0]);
-            ay1 = (int16_t)((adxl1_data[3] << 8) | adxl1_data[2]);
-            az1 = (int16_t)((adxl1_data[5] << 8) | adxl1_data[4]);
-            float accel_x1 = ax1 * adxl_cal_val;
-            float accel_y1 = ay1 * adxl_cal_val;
-            float accel_z1 = az1 * adxl_cal_val;
-            printf("ADXL1  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x1, accel_y1, accel_z1);
-            can_tx_adxl1(accel_x1, accel_y1, accel_z1);
-            last_tick_adxl1 = now;
-        }*/
+      /* -----------------------------------------------------------------
+       * ID 0x001 — dummy frame
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_dummy >= SENSOR_RATE_MS)
+      {
+          can_tx_dummy();
+          last_tick_dummy = now;
+      }
 
-        /*  --- ADXL345 #2 ---
-        if (now - last_tick_adxl2 >= SENSOR_RATE_MS)
-        {
-            HAL_I2C_Mem_Read(&hi2c3, 0x3A, 0x32, 1, adxl2_data, 6, HAL_MAX_DELAY);
-            ax2 = (int16_t)((adxl2_data[1] << 8) | adxl2_data[0]);
-            ay2 = (int16_t)((adxl2_data[3] << 8) | adxl2_data[2]);
-            az2 = (int16_t)((adxl2_data[5] << 8) | adxl2_data[4]);
-            float accel_x2 = ax2 * adxl_cal_val;
-            float accel_y2 = ay2 * adxl_cal_val;
-            float accel_z2 = az2 * adxl_cal_val;
-            printf("ADXL2  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x2, accel_y2, accel_z2);
-            can_tx_adxl2(accel_x2, accel_y2, accel_z2);
-            last_tick_adxl2 = now;
-        }*/
+      /* -----------------------------------------------------------------
+       * ID 0x002 — ADXL345 #1 (motor 1 vibration)
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_adxl1 >= SENSOR_RATE_MS)
+      {
+          HAL_I2C_Mem_Read(&hi2c3, 0xA6, 0x32, 1, adxl1_data, 6, HAL_MAX_DELAY);
+          ax1 = (int16_t)((adxl1_data[1] << 8) | adxl1_data[0]);
+          ay1 = (int16_t)((adxl1_data[3] << 8) | adxl1_data[2]);
+          az1 = (int16_t)((adxl1_data[5] << 8) | adxl1_data[4]);
+          float accel_x1 = ax1 * adxl_cal_val;
+          float accel_y1 = ay1 * adxl_cal_val;
+          float accel_z1 = az1 * adxl_cal_val;
+          printf("ADXL1  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x1, accel_y1, accel_z1);
+          can_tx_adxl1(accel_x1, accel_y1, accel_z1);
+          last_tick_adxl1 = now;
+      }
 
-        /*  --- Quadrature encoder ---
-        if (now - last_tick_encoder >= SENSOR_RATE_MS)
-        {
-            int16_t counts    = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
-            float   angle_deg = ((float)counts * 360.0f) / 16384.0f;
-            printf("counts: %d  encoder angle: %.2f deg\r\n", counts, angle_deg);
-            can_tx_encoder(counts, angle_deg);
-            last_tick_encoder = now;
-        }*/
+      /* -----------------------------------------------------------------
+       * ID 0x003 — ADXL345 #2 (motor 2 vibration)
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_adxl2 >= SENSOR_RATE_MS)
+      {
+          HAL_I2C_Mem_Read(&hi2c3, 0x3A, 0x32, 1, adxl2_data, 6, HAL_MAX_DELAY);
+          ax2 = (int16_t)((adxl2_data[1] << 8) | adxl2_data[0]);
+          ay2 = (int16_t)((adxl2_data[3] << 8) | adxl2_data[2]);
+          az2 = (int16_t)((adxl2_data[5] << 8) | adxl2_data[4]);
+          float accel_x2 = ax2 * adxl_cal_val;
+          float accel_y2 = ay2 * adxl_cal_val;
+          float accel_z2 = az2 * adxl_cal_val;
+          printf("ADXL2  x:%.2f  y:%.2f  z:%.2f g\r\n", accel_x2, accel_y2, accel_z2);
+          can_tx_adxl2(accel_x2, accel_y2, accel_z2);
+          last_tick_adxl2 = now;
+      }
 
-        /*  --- RPM ---
-        if (now - last_tick_rpm >= SENSOR_RATE_MS)
-        {
-            if (time_since_pulse > RPM_TIMEOUT) { rpm = 0.0f; rpm_avg = 0.0f; }
-            printf("RPM: %.1f\r\n", rpm_avg);
-            can_tx_rpm(rpm_avg);
-            last_tick_rpm = now;
-        }*/
+      /* -----------------------------------------------------------------
+       * ID 0x004 — Hall sensor #1 RPM
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_rpm_1 >= SENSOR_RATE_MS)
+      {
+          current_time = __HAL_TIM_GET_COUNTER(&htim2);
+          uint32_t time_since_pulse_1;
+          if (current_time >= last_time_1)
+              time_since_pulse_1 = current_time - last_time_1;
+          else
+              time_since_pulse_1 = (0xFFFFFFFFU - last_time_1) + current_time;
 
-    }
+          if (time_since_pulse_1 > RPM_TIMEOUT)
+          {
+              rpm_1     = 0.0f;
+              rpm_1_avg = 0.0f;
+          }
+          printf("RPM #1 Pulses: %lu  RPM: %.1f\r\n", pulse_1_count, rpm_1_avg);
+          can_tx_rpm(rpm_1_avg);
+          last_tick_rpm_1 = now;
+      }
+
+      /* -----------------------------------------------------------------
+       * ID 0x008 — Hall sensor #2 RPM
+       * ----------------------------------------------------------------- */
+      if (now - last_tick_rpm_2 >= SENSOR_RATE_MS)
+      {
+          current_time = __HAL_TIM_GET_COUNTER(&htim2);
+          uint32_t time_since_pulse_2;
+          if (current_time >= last_time_2)
+              time_since_pulse_2 = current_time - last_time_2;
+          else
+              time_since_pulse_2 = (0xFFFFFFFFU - last_time_2) + current_time;
+
+          if (time_since_pulse_2 > RPM_TIMEOUT)
+          {
+              rpm_2     = 0.0f;
+              rpm_2_avg = 0.0f;
+          }
+          printf("RPM #2 Pulses: %lu  RPM: %.1f\r\n", pulse_2_count, rpm_2_avg);
+          can_tx_rpm2(rpm_2_avg);
+          last_tick_rpm_2 = now;
+      }
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
 }
 
-/* =========================================================================
- * SystemClock_Config
- * ========================================================================= */
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
-    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLM       = RCC_PLLM_DIV6;
-    RCC_OscInitStruct.PLL.PLLN       = 85;
-    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
-    RCC_OscInitStruct.PLL.PLLQ       = RCC_PLLQ_DIV2;
-    RCC_OscInitStruct.PLL.PLLR       = RCC_PLLR_DIV2;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV6;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) Error_Handler();
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
-/* =========================================================================
- * Peripheral init functions (unchanged from CubeMX output)
- * ========================================================================= */
+/**
+  * @brief ADC1 Initialization Function
+  */
 static void MX_ADC1_Init(void)
 {
-    ADC_MultiModeTypeDef   multimode = {0};
-    ADC_ChannelConfTypeDef sConfig   = {0};
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
 
-    hadc1.Instance                   = ADC1;
-    hadc1.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV4;
-    hadc1.Init.Resolution            = ADC_RESOLUTION_12B;
-    hadc1.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
-    hadc1.Init.GainCompensation      = 0;
-    hadc1.Init.ScanConvMode          = ADC_SCAN_DISABLE;
-    hadc1.Init.EOCSelection          = ADC_EOC_SINGLE_CONV;
-    hadc1.Init.LowPowerAutoWait      = DISABLE;
-    hadc1.Init.ContinuousConvMode    = DISABLE;
-    hadc1.Init.NbrOfConversion       = 1;
-    hadc1.Init.DiscontinuousConvMode = DISABLE;
-    hadc1.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
-    hadc1.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
-    hadc1.Init.DMAContinuousRequests = DISABLE;
-    hadc1.Init.Overrun               = ADC_OVR_DATA_PRESERVED;
-    hadc1.Init.OversamplingMode      = DISABLE;
-    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
 
-    multimode.Mode = ADC_MODE_INDEPENDENT;
-    if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK) Error_Handler();
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK) Error_Handler();
 
-    sConfig.Channel      = ADC_CHANNEL_7;
-    sConfig.Rank         = ADC_REGULAR_RANK_1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
-    sConfig.SingleDiff   = ADC_SINGLE_ENDED;
-    sConfig.OffsetNumber = ADC_OFFSET_NONE;
-    sConfig.Offset       = 0;
-    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
+  sConfig.Channel = ADC_CHANNEL_7;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 }
 
+/**
+  * @brief FDCAN1 Initialization Function
+  */
 static void MX_FDCAN1_Init(void)
 {
-    hfdcan1.Instance                 = FDCAN1;
-    hfdcan1.Init.ClockDivider        = FDCAN_CLOCK_DIV1;
-    hfdcan1.Init.FrameFormat         = FDCAN_FRAME_FD_NO_BRS;
-    hfdcan1.Init.Mode                = FDCAN_MODE_NORMAL;
-    hfdcan1.Init.AutoRetransmission  = ENABLE;
-    hfdcan1.Init.TransmitPause       = ENABLE;
-    hfdcan1.Init.ProtocolException   = DISABLE;
-    hfdcan1.Init.NominalPrescaler    = 2;
-    hfdcan1.Init.NominalSyncJumpWidth = 39;
-    hfdcan1.Init.NominalTimeSeg1     = 130;
-    hfdcan1.Init.NominalTimeSeg2     = 39;
-    hfdcan1.Init.DataPrescaler       = 17;
-    hfdcan1.Init.DataSyncJumpWidth   = 6;
-    hfdcan1.Init.DataTimeSeg1        = 13;
-    hfdcan1.Init.DataTimeSeg2        = 6;
-    hfdcan1.Init.StdFiltersNbr       = 1;
-    hfdcan1.Init.ExtFiltersNbr       = 0;
-    hfdcan1.Init.TxFifoQueueMode     = FDCAN_TX_QUEUE_OPERATION;
-    if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) Error_Handler();
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_NO_BRS;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.TransmitPause = ENABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  hfdcan1.Init.NominalPrescaler = 2;
+  hfdcan1.Init.NominalSyncJumpWidth = 39;
+  hfdcan1.Init.NominalTimeSeg1 = 130;
+  hfdcan1.Init.NominalTimeSeg2 = 39;
+  hfdcan1.Init.DataPrescaler = 17;
+  hfdcan1.Init.DataSyncJumpWidth = 6;
+  hfdcan1.Init.DataTimeSeg1 = 13;
+  hfdcan1.Init.DataTimeSeg2 = 6;
+  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_QUEUE_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) Error_Handler();
 }
 
+/**
+  * @brief I2C2 Initialization Function
+  */
+static void MX_I2C2_Init(void)
+{
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.Timing = 0x40B285C2;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK) Error_Handler();
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK) Error_Handler();
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK) Error_Handler();
+}
+
+/**
+  * @brief I2C3 Initialization Function
+  */
 static void MX_I2C3_Init(void)
 {
-    hi2c3.Instance              = I2C3;
-    hi2c3.Init.Timing           = 0x40B285C2;
-    hi2c3.Init.OwnAddress1      = 0;
-    hi2c3.Init.AddressingMode   = I2C_ADDRESSINGMODE_7BIT;
-    hi2c3.Init.DualAddressMode  = I2C_DUALADDRESS_DISABLE;
-    hi2c3.Init.OwnAddress2      = 0;
-    hi2c3.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-    hi2c3.Init.GeneralCallMode  = I2C_GENERALCALL_DISABLE;
-    hi2c3.Init.NoStretchMode    = I2C_NOSTRETCH_DISABLE;
-    if (HAL_I2C_Init(&hi2c3) != HAL_OK) Error_Handler();
-    if (HAL_I2CEx_ConfigAnalogFilter(&hi2c3, I2C_ANALOGFILTER_ENABLE) != HAL_OK) Error_Handler();
-    if (HAL_I2CEx_ConfigDigitalFilter(&hi2c3, 0) != HAL_OK) Error_Handler();
+  hi2c3.Instance = I2C3;
+  hi2c3.Init.Timing = 0x40B285C2;
+  hi2c3.Init.OwnAddress1 = 0;
+  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK) Error_Handler();
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c3, I2C_ANALOGFILTER_ENABLE) != HAL_OK) Error_Handler();
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c3, 0) != HAL_OK) Error_Handler();
 }
 
-static void MX_TIM1_Init(void)
+/**
+  * @brief I2C4 Initialization Function
+  */
+static void MX_I2C4_Init(void)
 {
-    TIM_MasterConfigTypeDef      sMasterConfig      = {0};
-    TIM_OC_InitTypeDef           sConfigOC          = {0};
-    TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-    htim1.Instance               = TIM1;
-    htim1.Init.Prescaler         = 0;
-    htim1.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim1.Init.Period            = 65535;
-    htim1.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim1.Init.RepetitionCounter = 0;
-    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) Error_Handler();
-
-    sMasterConfig.MasterOutputTrigger  = TIM_TRGO_RESET;
-    sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
-    sMasterConfig.MasterSlaveMode      = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) Error_Handler();
-
-    sConfigOC.OCMode       = TIM_OCMODE_PWM1;
-    sConfigOC.Pulse        = 0;
-    sConfigOC.OCPolarity   = TIM_OCPOLARITY_HIGH;
-    sConfigOC.OCNPolarity  = TIM_OCNPOLARITY_HIGH;
-    sConfigOC.OCFastMode   = TIM_OCFAST_DISABLE;
-    sConfigOC.OCIdleState  = TIM_OCIDLESTATE_RESET;
-    sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK) Error_Handler();
-
-    sBreakDeadTimeConfig.OffStateRunMode  = TIM_OSSR_DISABLE;
-    sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-    sBreakDeadTimeConfig.LockLevel        = TIM_LOCKLEVEL_OFF;
-    sBreakDeadTimeConfig.DeadTime         = 0;
-    sBreakDeadTimeConfig.BreakState       = TIM_BREAK_DISABLE;
-    sBreakDeadTimeConfig.BreakPolarity    = TIM_BREAKPOLARITY_HIGH;
-    sBreakDeadTimeConfig.BreakFilter      = 0;
-    sBreakDeadTimeConfig.BreakAFMode      = TIM_BREAK_AFMODE_INPUT;
-    sBreakDeadTimeConfig.Break2State      = TIM_BREAK2_DISABLE;
-    sBreakDeadTimeConfig.Break2Polarity   = TIM_BREAK2POLARITY_HIGH;
-    sBreakDeadTimeConfig.Break2Filter     = 0;
-    sBreakDeadTimeConfig.Break2AFMode     = TIM_BREAK_AFMODE_INPUT;
-    sBreakDeadTimeConfig.AutomaticOutput  = TIM_AUTOMATICOUTPUT_DISABLE;
-    if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK) Error_Handler();
-
-    HAL_TIM_MspPostInit(&htim1);
+  hi2c4.Instance = I2C4;
+  hi2c4.Init.Timing = 0x40B285C2;
+  hi2c4.Init.OwnAddress1 = 0;
+  hi2c4.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c4.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c4.Init.OwnAddress2 = 0;
+  hi2c4.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c4.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c4.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c4) != HAL_OK) Error_Handler();
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c4, I2C_ANALOGFILTER_ENABLE) != HAL_OK) Error_Handler();
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c4, 0) != HAL_OK) Error_Handler();
 }
 
+/**
+  * @brief TIM2 Initialization Function
+  */
 static void MX_TIM2_Init(void)
 {
-    TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
-    TIM_MasterConfigTypeDef sMasterConfig      = {0};
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-    htim2.Instance               = TIM2;
-    htim2.Init.Prescaler         = 169;
-    htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim2.Init.Period            = 4294967295U;
-    htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 169;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
 
-    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-    if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) Error_Handler();
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) Error_Handler();
 
-    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-    sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) Error_Handler();
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) Error_Handler();
 }
 
-static void MX_TIM3_Init(void)
-{
-    TIM_Encoder_InitTypeDef sConfig      = {0};
-    TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-    htim3.Instance               = TIM3;
-    htim3.Init.Prescaler         = 0;
-    htim3.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim3.Init.Period            = 65535;
-    htim3.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
-    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-
-    sConfig.EncoderMode   = TIM_ENCODERMODE_TI12;
-    sConfig.IC1Polarity   = TIM_ICPOLARITY_RISING;
-    sConfig.IC1Selection  = TIM_ICSELECTION_DIRECTTI;
-    sConfig.IC1Prescaler  = TIM_ICPSC_DIV1;
-    sConfig.IC1Filter     = 0;
-    sConfig.IC2Polarity   = TIM_ICPOLARITY_RISING;
-    sConfig.IC2Selection  = TIM_ICSELECTION_DIRECTTI;
-    sConfig.IC2Prescaler  = TIM_ICPSC_DIV1;
-    sConfig.IC2Filter     = 0;
-    if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK) Error_Handler();
-
-    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-    sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) Error_Handler();
-}
-
-static void MX_TIM6_Init(void)
-{
-    TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-    htim6.Instance               = TIM6;
-    htim6.Init.Prescaler         = 0;
-    htim6.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim6.Init.Period            = 65535;
-    htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_Base_Init(&htim6) != HAL_OK) Error_Handler();
-
-    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-    sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK) Error_Handler();
-}
-
+/**
+  * @brief GPIO Initialization Function
+  */
 static void MX_GPIO_Init(void)
 {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    __HAL_RCC_GPIOF_CLK_ENABLE();
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
-    /* LED on PA5 */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
-    GPIO_InitStruct.Pin   = GPIO_PIN_5;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* Hall sensor input on PA0 */
-    GPIO_InitStruct.Pin  = GPIO_PIN_0;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
-    HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
 }
 
-/* =========================================================================
- * Error handler
- * ========================================================================= */
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
 void Error_Handler(void)
 {
-    __disable_irq();
-    while (1)
-    {
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-        HAL_Delay(100);
-    }
+  /* USER CODE BEGIN Error_Handler_Debug */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line)
 {
-    printf("Assert failed: file %s, line %lu\r\n", file, (unsigned long)line);
+  /* USER CODE BEGIN 6 */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
