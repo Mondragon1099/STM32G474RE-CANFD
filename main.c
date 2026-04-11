@@ -15,20 +15,24 @@
   *   - Throttle : 0-5V mapping             (PC0, ADC1)
   *
   * CAN FD TX frames (built and sent via can_frames.c):
-  *   ID 0x000  — AS5600 #1 steering angle     2 bytes
-  *   ID 0x001  — dummy frame                  2 bytes
-  *   ID 0x002  — ADXL345 #1 unsafe flag       1 byte  (0=safe, 1=unsafe)
-  *   ID 0x003  — ADXL345 #2 unsafe flag       1 byte  (0=safe, 1=unsafe)
-  *   ID 0x004  — Hall sensor #1 RPM           2 bytes
-  *   ID 0x006  — AS5600 #2 steering angle     2 bytes
-  *   ID 0x007  — AS5600 #3 steering angle     2 bytes
-  *   ID 0x008  — Hall sensor #2 RPM           2 bytes
-  *   ID 0x009  — Throttle                     2 bytes
+  *   ID 0x040  — steering              (AS5600 #1)  2 bytes   @ 500 Hz  (2ms)
+  *   ID 0x122  — stepper_FeedbackLeft  (AS5600 #2)  2 bytes   @  10 Hz  (100ms)
+  *   ID 0x123  — stepper_FeedbackRight (AS5600 #3)  2 bytes   @  10 Hz  (100ms)
+  *   ID 0x2C8  — throttle_Input                     2 bytes   @  50 Hz  (20ms)
+  *   ID 0x420  — motor_RpmLeft         (Hall #1)    2 bytes   @ 1000 Hz (1ms)
+  *   ID 0x421  — motor_RpmRight        (Hall #2)    2 bytes   @ 1000 Hz (1ms)
+  *   ID 0x480  — motor_VibrationLeft   (ADXL345 #1) 1 byte    @ 100 Hz  (10ms)
+  *   ID 0x481  — motor_VibrationRight  (ADXL345 #2) 1 byte    @ 100 Hz  (10ms)
   *
-  * Timing:
-  *   All frames currently send at 1000ms (HAL_GetTick based, non-blocking)
-  *   ADXL samples collected at SENSOR_RATE_MS / ADXL_SAMPLES (100ms)
-  *   ADXL CAN frame sent once per 10 samples (1000ms)
+  * Timing (HAL_GetTick based, non-blocking):
+  *   throttle_Input        :  50 Hz →  20 ms
+  *   steering              : 500 Hz →   2 ms
+  *   stepper_FeedbackLeft  :  10 Hz → 100 ms
+  *   stepper_FeedbackRight :  10 Hz → 100 ms
+  *   motor_VibrationLeft   : 100 Hz →  10 ms  (ADXL sample interval = 10ms/10 = 1ms)
+  *   motor_VibrationRight  : 100 Hz →  10 ms  (ADXL sample interval = 10ms/10 = 1ms)
+  *   motor_RpmLeft         : 1000 Hz →  1 ms
+  *   motor_RpmRight        : 1000 Hz →  1 ms
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -72,26 +76,26 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 
-/* --- AS5600 #1 steering angle (I2C3) --- */
-uint8_t  as56001_data[2];
-uint16_t as56001_raw = 0;
-float    as56001_deg = 0.0f;
+/* --- AS5600 #1  steering (I2C3) --- */
+uint8_t  steering_data[2];
+uint16_t steering_raw = 0;
+float    steering_deg = 0.0f;
 
-/* --- AS5600 #2 steering angle (I2C4) --- */
-uint8_t  as56002_data[2];
-uint16_t as56002_raw = 0;
-float    as56002_deg = 0.0f;
+/* --- AS5600 #2  stepper_FeedbackLeft (I2C4) --- */
+uint8_t  stepper_feedbackLeft_data[2];
+uint16_t stepper_feedbackLeft_raw = 0;
+float    stepper_feedbackLeft_deg = 0.0f;
 
-/* --- AS5600 #3 steering angle (I2C2) --- */
-uint8_t  as56003_data[2];
-uint16_t as56003_raw = 0;
-float    as56003_deg = 0.0f;
+/* --- AS5600 #3  stepper_FeedbackRight (I2C2) --- */
+uint8_t  stepper_feedbackRight_data[2];
+uint16_t stepper_feedbackRight_raw = 0;
+float    stepper_feedbackRight_deg = 0.0f;
 
 /* --- Throttle 0-5V (ADC1) --- */
 uint16_t throttle_raw = 0;
 float    throttle_out = 0.0f;
 
-/* --- ADXL345 #1 (motor 1) --- */
+/* --- ADXL345 #1  motor_VibrationLeft --- */
 #define ADXL_SAMPLES  10
 #define ADXL_THRESH_X 0.08f
 #define ADXL_THRESH_Y 0.08f
@@ -107,7 +111,7 @@ uint8_t  adxl_power_ctl = 0x08;
 float    adxl_cal_val   = 0.0039f;
 int      adxl1_index = 0;
 
-/* --- ADXL345 #2 (motor 2) --- */
+/* --- ADXL345 #2  motor_VibrationRight --- */
 uint8_t  adxl2_id;
 uint8_t  adxl2_data[6];
 int16_t  ax2, ay2, az2;
@@ -116,7 +120,7 @@ float    mean_x2 = 0.0f, mean_y2 = 0.0f, mean_z2 = 0.0f;
 float    sum_x2  = 0.0f, sum_y2  = 0.0f, sum_z2  = 0.0f;
 int      adxl2_index = 0;
 
-/* --- Hall-effect #1 RPM --- */
+/* --- Hall-effect #1  motor_RpmLeft --- */
 #define AVG_SAMPLES           5
 #define PULSES_PER_REVOLUTION 4
 #define RPM_TIMEOUT           3000000U    // 3 s in microseconds
@@ -131,7 +135,7 @@ volatile uint8_t  new_rpm_1_ready   = 0;
 volatile float   rpm_1_buffer[AVG_SAMPLES] = {0};
 volatile uint8_t rpm_1_buffer_index        = 0;
 
-/* --- Hall-effect #2 RPM --- */
+/* --- Hall-effect #2  motor_RpmRight --- */
 volatile uint32_t pulse_2_count     = 0;
 volatile uint32_t last_time_2       = 0;
 volatile float    rpm_2             = 0.0f;
@@ -143,19 +147,25 @@ volatile uint8_t rpm_2_buffer_index        = 0;
 /* --- FDCAN filter config --- */
 FDCAN_FilterTypeDef sFilterConfig;
 
-/* --- Sensor update rate (ms) --- */
-#define SENSOR_RATE_MS   1000U
+/* --- Send-rate intervals (ms) --- */
+#define RATE_STEERING_MS              2U    // 500 Hz
+#define RATE_STEPPER_FEEDBACK_MS    100U    //  10 Hz
+#define RATE_THROTTLE_MS             20U    //  50 Hz
+#define RATE_MOTOR_VIBRATION_MS      10U    // 100 Hz
+#define RATE_MOTOR_RPM_MS             1U    // 1000 Hz
+
+/* ADXL sample interval = vibration send-rate / number of samples */
+#define ADXL_SAMPLE_INTERVAL_MS  (RATE_MOTOR_VIBRATION_MS / ADXL_SAMPLES)  // 1 ms
 
 /* --- Tick timestamps — one per frame --- */
-static uint32_t last_tick_steering1 = 0;
-static uint32_t last_tick_steering2 = 0;
-static uint32_t last_tick_steering3 = 0;
-static uint32_t last_tick_throttle  = 0;
-static uint32_t last_tick_dummy     = 0;
-static uint32_t last_tick_adxl1     = 0;
-static uint32_t last_tick_adxl2     = 0;
-static uint32_t last_tick_rpm_1     = 0;
-static uint32_t last_tick_rpm_2     = 0;
+static uint32_t last_tick_steering              = 0;
+static uint32_t last_tick_stepper_feedbackLeft  = 0;
+static uint32_t last_tick_stepper_feedbackRight = 0;
+static uint32_t last_tick_throttle              = 0;
+static uint32_t last_tick_motor_vibrationLeft   = 0;
+static uint32_t last_tick_motor_vibrationRight  = 0;
+static uint32_t last_tick_motor_rpmLeft         = 0;
+static uint32_t last_tick_motor_rpmRight        = 0;
 
 /* USER CODE END PV */
 
@@ -333,86 +343,77 @@ int main(void)
       uint32_t now = HAL_GetTick();
 
       /* -----------------------------------------------------------------
-       * ID 0x000 — AS5600 #1 steering angle (I2C3)
+       * ID 0x040 — steering  (AS5600 #1, I2C3)  @ 500 Hz / 2 ms
        * ----------------------------------------------------------------- */
-      if (now - last_tick_steering1 >= SENSOR_RATE_MS)
+      if (now - last_tick_steering >= RATE_STEERING_MS)
       {
           if (HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0E,
-                  I2C_MEMADD_SIZE_8BIT, &as56001_data[0], 1, HAL_MAX_DELAY) == HAL_OK
+                  I2C_MEMADD_SIZE_8BIT, &steering_data[0], 1, HAL_MAX_DELAY) == HAL_OK
            && HAL_I2C_Mem_Read(&hi2c3, 0x36 << 1, 0x0F,
-                  I2C_MEMADD_SIZE_8BIT, &as56001_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
+                  I2C_MEMADD_SIZE_8BIT, &steering_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
           {
-              as56001_raw = ((uint16_t)as56001_data[0] << 8) | as56001_data[1];
-              as56001_deg = (as56001_raw * 360.0f) / 4096.0f;
+              steering_raw = ((uint16_t)steering_data[0] << 8) | steering_data[1];
+              steering_deg = (steering_raw * 360.0f) / 4096.0f;
           }
-          printf("AS5600 #1 angle: %.2f deg\r\n", as56001_deg);
-          can_tx_steering1(as56001_deg);
-          last_tick_steering1 = now;
+          printf("steering angle: %.2f deg\r\n", steering_deg);
+          can_tx_steering1(steering_deg);
+          last_tick_steering = now;
       }
 
       /* -----------------------------------------------------------------
-       * ID 0x006 — AS5600 #2 steering angle (I2C4)
+       * ID 0x122 — stepper_FeedbackLeft  (AS5600 #2, I2C4)  @ 10 Hz / 100 ms
        * ----------------------------------------------------------------- */
-      if (now - last_tick_steering2 >= SENSOR_RATE_MS)
+      if (now - last_tick_stepper_feedbackLeft >= RATE_STEPPER_FEEDBACK_MS)
       {
           if (HAL_I2C_Mem_Read(&hi2c4, 0x36 << 1, 0x0E,
-                  I2C_MEMADD_SIZE_8BIT, &as56002_data[0], 1, HAL_MAX_DELAY) == HAL_OK
+                  I2C_MEMADD_SIZE_8BIT, &stepper_feedbackLeft_data[0], 1, HAL_MAX_DELAY) == HAL_OK
            && HAL_I2C_Mem_Read(&hi2c4, 0x36 << 1, 0x0F,
-                  I2C_MEMADD_SIZE_8BIT, &as56002_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
+                  I2C_MEMADD_SIZE_8BIT, &stepper_feedbackLeft_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
           {
-              as56002_raw = ((uint16_t)as56002_data[0] << 8) | as56002_data[1];
-              as56002_deg = (as56002_raw * 360.0f) / 4096.0f;
+              stepper_feedbackLeft_raw = ((uint16_t)stepper_feedbackLeft_data[0] << 8) | stepper_feedbackLeft_data[1];
+              stepper_feedbackLeft_deg = (stepper_feedbackLeft_raw * 360.0f) / 4096.0f;
           }
-          printf("AS5600 #2 angle: %.2f deg\r\n", as56002_deg);
-          can_tx_steering2(as56002_deg);
-          last_tick_steering2 = now;
+          printf("stepper_FeedbackLeft angle: %.2f deg\r\n", stepper_feedbackLeft_deg);
+          can_tx_steering2(stepper_feedbackLeft_deg);
+          last_tick_stepper_feedbackLeft = now;
       }
 
       /* -----------------------------------------------------------------
-       * ID 0x007 — AS5600 #3 steering angle (I2C2)
+       * ID 0x123 — stepper_FeedbackRight  (AS5600 #3, I2C2)  @ 10 Hz / 100 ms
        * ----------------------------------------------------------------- */
-      if (now - last_tick_steering3 >= SENSOR_RATE_MS)
+      if (now - last_tick_stepper_feedbackRight >= RATE_STEPPER_FEEDBACK_MS)
       {
           if (HAL_I2C_Mem_Read(&hi2c2, 0x36 << 1, 0x0E,
-                  I2C_MEMADD_SIZE_8BIT, &as56003_data[0], 1, HAL_MAX_DELAY) == HAL_OK
+                  I2C_MEMADD_SIZE_8BIT, &stepper_feedbackRight_data[0], 1, HAL_MAX_DELAY) == HAL_OK
            && HAL_I2C_Mem_Read(&hi2c2, 0x36 << 1, 0x0F,
-                  I2C_MEMADD_SIZE_8BIT, &as56003_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
+                  I2C_MEMADD_SIZE_8BIT, &stepper_feedbackRight_data[1], 1, HAL_MAX_DELAY) == HAL_OK)
           {
-              as56003_raw = ((uint16_t)as56003_data[0] << 8) | as56003_data[1];
-              as56003_deg = (as56003_raw * 360.0f) / 4096.0f;
+              stepper_feedbackRight_raw = ((uint16_t)stepper_feedbackRight_data[0] << 8) | stepper_feedbackRight_data[1];
+              stepper_feedbackRight_deg = (stepper_feedbackRight_raw * 360.0f) / 4096.0f;
           }
-          printf("AS5600 #3 angle: %.2f deg\r\n", as56003_deg);
-          can_tx_steering3(as56003_deg);
-          last_tick_steering3 = now;
+          printf("stepper_FeedbackRight angle: %.2f deg\r\n", stepper_feedbackRight_deg);
+          can_tx_steering3(stepper_feedbackRight_deg);
+          last_tick_stepper_feedbackRight = now;
       }
 
       /* -----------------------------------------------------------------
-       * ID 0x009 — Throttle 0-3.3V (ADC)
+       * ID 0x2C8 — throttle_Input  (ADC1)  @ 50 Hz / 20 ms
        * ----------------------------------------------------------------- */
-      if (now - last_tick_throttle >= SENSOR_RATE_MS)
+      if (now - last_tick_throttle >= RATE_THROTTLE_MS)
       {
           throttle_raw = read_adc();
           throttle_out = (throttle_raw * 3.3f) / 4096.0f;
-          printf("Throttle: %.2f V\r\n", throttle_out);
+          printf("throttle_Input: %.2f V\r\n", throttle_out);
           can_tx_throttle(throttle_out);
           last_tick_throttle = now;
       }
 
       /* -----------------------------------------------------------------
-       * ID 0x001 — dummy frame
+       * ID 0x480 — motor_VibrationLeft  (ADXL345 #1)  @ 100 Hz / 10 ms
+       * Samples collected every ADXL_SAMPLE_INTERVAL_MS (1 ms)
+       * CAN frame sent once per ADXL_SAMPLES (10) samples with unsafe flag
        * ----------------------------------------------------------------- */
-      if (now - last_tick_dummy >= SENSOR_RATE_MS)
-      {
-          can_tx_dummy();
-          last_tick_dummy = now;
-      }
-
-      /* -----------------------------------------------------------------
-       * ID 0x002 — ADXL345 #1 (motor 1 vibration)
-       * Samples collected at SENSOR_RATE_MS / ADXL_SAMPLES = 100ms
-       * CAN frame sent once per 10 samples with unsafe flag
-       * ----------------------------------------------------------------- */
-      if (now - last_tick_adxl1 >= SENSOR_RATE_MS / ADXL_SAMPLES)
+      if (now - last_tick_motor_vibrationLeft >= ADXL_SAMPLE_INTERVAL_MS)
       {
           HAL_I2C_Mem_Read(&hi2c3, 0xA6, 0x32, 1, adxl1_data, 6, HAL_MAX_DELAY);
           ax1 = (int16_t)((adxl1_data[1] << 8) | adxl1_data[0]);
@@ -424,7 +425,8 @@ int main(void)
               accel_x1[adxl1_index] = ax1 * adxl_cal_val;
               accel_y1[adxl1_index] = ay1 * adxl_cal_val;
               accel_z1[adxl1_index] = az1 * adxl_cal_val;
-              printf("ADXL1 x:%0.2f y:%0.2f z:%0.2f\r\n", accel_x1[adxl1_index], accel_y1[adxl1_index], accel_z1[adxl1_index]);
+              printf("motor_VibrationLeft x:%0.2f y:%0.2f z:%0.2f\r\n",
+                     accel_x1[adxl1_index], accel_y1[adxl1_index], accel_z1[adxl1_index]);
               adxl1_index++;
           }
           else
@@ -441,28 +443,30 @@ int main(void)
               for (int i = 0; i < adxl1_index; i++) sum_y1 += (accel_y1[i] - mean_y1) * (accel_y1[i] - mean_y1);
               for (int i = 0; i < adxl1_index; i++) sum_z1 += (accel_z1[i] - mean_z1) * (accel_z1[i] - mean_z1);
 
-              uint8_t adxl1_unsafe = (sqrtf(sum_x1 / (float)ADXL_SAMPLES) > ADXL_THRESH_X) ||
-                                     (sqrtf(sum_y1 / (float)ADXL_SAMPLES) > ADXL_THRESH_Y) ||
-                                     (sqrtf(sum_z1 / (float)ADXL_SAMPLES) > ADXL_THRESH_Z);
-              printf("ADXL1 x deviation: %0.2f\r\n", sqrtf(sum_x1 / (float)ADXL_SAMPLES));
-              printf("ADXL1 y deviation: %0.2f\r\n", sqrtf(sum_y1 / (float)ADXL_SAMPLES));
-              printf("ADXL1 z deviation: %0.2f\r\n", sqrtf(sum_z1 / (float)ADXL_SAMPLES));
-              printf("ADXL1 unsafe: %d\r\n", adxl1_unsafe);
-              can_tx_adxl1(adxl1_unsafe);
+              uint8_t motor_vibrationLeft_unsafe =
+                  (sqrtf(sum_x1 / (float)ADXL_SAMPLES) > ADXL_THRESH_X) ||
+                  (sqrtf(sum_y1 / (float)ADXL_SAMPLES) > ADXL_THRESH_Y) ||
+                  (sqrtf(sum_z1 / (float)ADXL_SAMPLES) > ADXL_THRESH_Z);
+
+              printf("motor_VibrationLeft x deviation: %0.2f\r\n", sqrtf(sum_x1 / (float)ADXL_SAMPLES));
+              printf("motor_VibrationLeft y deviation: %0.2f\r\n", sqrtf(sum_y1 / (float)ADXL_SAMPLES));
+              printf("motor_VibrationLeft z deviation: %0.2f\r\n", sqrtf(sum_z1 / (float)ADXL_SAMPLES));
+              printf("motor_VibrationLeft unsafe: %d\r\n", motor_vibrationLeft_unsafe);
+              can_tx_adxl1(motor_vibrationLeft_unsafe);
 
               adxl1_index = 0;
               sum_x1  = 0.0f; sum_y1  = 0.0f; sum_z1  = 0.0f;
               mean_x1 = 0.0f; mean_y1 = 0.0f; mean_z1 = 0.0f;
           }
 
-          last_tick_adxl1 = now;
+          last_tick_motor_vibrationLeft = now;
       }
 
       /* -----------------------------------------------------------------
-       * ID 0x003 — ADXL345 #2 (motor 2 vibration)
-       * Same approach as ADXL345 #1
+       * ID 0x481 — motor_VibrationRight  (ADXL345 #2)  @ 100 Hz / 10 ms
+       * Same approach as motor_VibrationLeft
        * ----------------------------------------------------------------- */
-      if (now - last_tick_adxl2 >= SENSOR_RATE_MS / ADXL_SAMPLES)
+      if (now - last_tick_motor_vibrationRight >= ADXL_SAMPLE_INTERVAL_MS)
       {
           HAL_I2C_Mem_Read(&hi2c3, 0x3A, 0x32, 1, adxl2_data, 6, HAL_MAX_DELAY);
           ax2 = (int16_t)((adxl2_data[1] << 8) | adxl2_data[0]);
@@ -490,25 +494,26 @@ int main(void)
               for (int i = 0; i < adxl2_index; i++) sum_y2 += (accel_y2[i] - mean_y2) * (accel_y2[i] - mean_y2);
               for (int i = 0; i < adxl2_index; i++) sum_z2 += (accel_z2[i] - mean_z2) * (accel_z2[i] - mean_z2);
 
-              uint8_t adxl2_unsafe = (sqrtf(sum_x2 / (float)ADXL_SAMPLES) > ADXL_THRESH_X) ||
-                                     (sqrtf(sum_y2 / (float)ADXL_SAMPLES) > ADXL_THRESH_Y) ||
-                                     (sqrtf(sum_z2 / (float)ADXL_SAMPLES) > ADXL_THRESH_Z);
+              uint8_t motor_vibrationRight_unsafe =
+                  (sqrtf(sum_x2 / (float)ADXL_SAMPLES) > ADXL_THRESH_X) ||
+                  (sqrtf(sum_y2 / (float)ADXL_SAMPLES) > ADXL_THRESH_Y) ||
+                  (sqrtf(sum_z2 / (float)ADXL_SAMPLES) > ADXL_THRESH_Z);
 
-              printf("ADXL2 unsafe: %d\r\n", adxl2_unsafe);
-              can_tx_adxl2(adxl2_unsafe);
+              printf("motor_VibrationRight unsafe: %d\r\n", motor_vibrationRight_unsafe);
+              can_tx_adxl2(motor_vibrationRight_unsafe);
 
               adxl2_index = 0;
               sum_x2  = 0.0f; sum_y2  = 0.0f; sum_z2  = 0.0f;
               mean_x2 = 0.0f; mean_y2 = 0.0f; mean_z2 = 0.0f;
           }
 
-          last_tick_adxl2 = now;
+          last_tick_motor_vibrationRight = now;
       }
 
       /* -----------------------------------------------------------------
-       * ID 0x004 — Hall sensor #1 RPM
+       * ID 0x420 — motor_RpmLeft  (Hall sensor #1)  @ 1000 Hz / 1 ms
        * ----------------------------------------------------------------- */
-      if (now - last_tick_rpm_1 >= SENSOR_RATE_MS)
+      if (now - last_tick_motor_rpmLeft >= RATE_MOTOR_RPM_MS)
       {
           current_time = __HAL_TIM_GET_COUNTER(&htim2);
           uint32_t time_since_pulse_1;
@@ -522,15 +527,15 @@ int main(void)
               rpm_1     = 0.0f;
               rpm_1_avg = 0.0f;
           }
-          printf("RPM #1 Pulses: %lu  RPM: %.1f\r\n", pulse_1_count, rpm_1_avg);
+          printf("motor_RpmLeft  Pulses: %lu  RPM: %.1f\r\n", pulse_1_count, rpm_1_avg);
           can_tx_rpm(rpm_1_avg);
-          last_tick_rpm_1 = now;
+          last_tick_motor_rpmLeft = now;
       }
 
       /* -----------------------------------------------------------------
-       * ID 0x008 — Hall sensor #2 RPM
+       * ID 0x421 — motor_RpmRight  (Hall sensor #2)  @ 1000 Hz / 1 ms
        * ----------------------------------------------------------------- */
-      if (now - last_tick_rpm_2 >= SENSOR_RATE_MS)
+      if (now - last_tick_motor_rpmRight >= RATE_MOTOR_RPM_MS)
       {
           current_time = __HAL_TIM_GET_COUNTER(&htim2);
           uint32_t time_since_pulse_2;
@@ -544,9 +549,9 @@ int main(void)
               rpm_2     = 0.0f;
               rpm_2_avg = 0.0f;
           }
-          printf("RPM #2 Pulses: %lu  RPM: %.1f\r\n", pulse_2_count, rpm_2_avg);
+          printf("motor_RpmRight Pulses: %lu  RPM: %.1f\r\n", pulse_2_count, rpm_2_avg);
           can_tx_rpm2(rpm_2_avg);
-          last_tick_rpm_2 = now;
+          last_tick_motor_rpmRight = now;
       }
 
     /* USER CODE END WHILE */
