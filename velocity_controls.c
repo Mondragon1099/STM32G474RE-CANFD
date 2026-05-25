@@ -657,7 +657,7 @@ int main(void)
         {
             case 0:   /* Ramp up to 30 RPM forward, hold 3 s */
                 target_pps = RPM_TO_PPS(400);
-                if (now - phase_start >= 6000U) { phase = 1; phase_start = now; }
+                if (now - phase_start >= 3000U) { phase = 1; phase_start = now; }
                 break;
 
             case 1:   /* Ramp up to 100 RPM forward, hold 3 s */
@@ -905,7 +905,7 @@ static void MX_TIM15_Init(void)
     GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull      = GPIO_NOPULL;
     GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF14_TIM15;
+    GPIO_InitStruct.Alternate = GPIO_AF1_TIM15;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     __HAL_RCC_TIM15_CLK_ENABLE();
